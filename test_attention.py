@@ -64,8 +64,8 @@ def test_with_dropout():
     dropout.train()
 
     out_with, weights_with = attention(q, k, v, dropout=dropout)
-    _, weights_without = attention(q, k, v)
+    out_without, weights_without = attention(q, k, v)
 
-    assert out_with.shape == weights_without.shape
+    assert out_with.shape == out_without.shape
     assert weights_with.shape == weights_without.shape
     assert not torch.allclose(weights_with, weights_without)
