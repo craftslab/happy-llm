@@ -1,8 +1,15 @@
 # happy-llm
 
-Scaled dot-product attention 实现（`attention.py`），附带单元测试。
+本仓库代码参考 [Happy-LLM 教程](https://datawhalechina.github.io/happy-llm)。
 
-本仓库代码参考 [Happy-LLM 教程](https://datawhalechina.github.io/happy-llm)（Datawhale 开源大模型实战教程）。
+## 项目结构
+
+| 文件 | 说明 |
+|------|------|
+| `attention.py` | 单头 scaled dot-product attention 函数 |
+| `multihead_attention.py` | `MultiHeadAttention` 模块与 `ModelArgs` 配置 |
+| `test_attention.py` | `attention()` 单元测试 |
+| `test_multihead_attention.py` | `MultiHeadAttention` 单元测试 |
 
 ## 核心运算：Q @ K^T
 
@@ -105,6 +112,228 @@ key   (..., seq_k, d_k)
    weights @ value  →  output
 ```
 
+## 多头注意力：MultiHeadAttention
+
+`multihead_attention.py` 在单头 attention 基础上，将 Q/K/V 拆成多个头并行计算，再拼接并投影回模型维度。
+
+### 基本用法
+
+```python
+import torch
+from multihead_attention import ModelArgs, MultiHeadAttention
+
+args = ModelArgs(dim=64, n_heads=8, dropout=0.1, max_seq_len=512)
+mha = MultiHeadAttention(args, is_causal=True)  # is_causal=True 启用因果 mask
+
+x = torch.randn(2, 16, 64)  # (batch, seq_len, dim)
+out = mha(x, x, x)          # 自注意力，输出形状 (2, 16, 64)
+```
+
+### 配置参数（ModelArgs）
+
+| 参数 | 说明 |
+|------|------|
+| `dim` | 模型隐藏维度，必须能被 `n_heads` 整除 |
+| `n_heads` | 注意力头数 |
+| `n_embd` | 输入嵌入维度，默认等于 `dim` |
+| `dropout` | attention 与残差 dropout 概率 |
+| `max_seq_len` | 因果 mask 的最大序列长度 |
+
+### 前向流程
+
+```
+输入 q, k, v  (B, T, dim)
+      ↓
+Linear 投影 Wq, Wk, Wv
+      ↓
+拆分为多头  (B, n_heads, T, head_dim)
+      ↓
+Q @ K^T / sqrt(head_dim)  →  softmax  →  dropout
+      ↓
+weights @ V
+      ↓
+拼接多头  (B, T, dim)
+      ↓
+Linear 投影 Wo  →  resid_dropout  →  输出
+```
+
+其中 `head_dim = dim // n_heads`。以下分步说明 `multihead_attention.py` 中的关键实现。
+
+### Q/K/V/Wo 线性投影
+
+`__init__` 中定义四个线性层，将输入投影为 Q/K/V，并在多头拼接后再映射回模型维度：
+
+```python
+self.wq = nn.Linear(args.n_embd, self.n_heads * self.head_dim, bias=False)
+self.wk = nn.Linear(args.n_embd, self.n_heads * self.head_dim, bias=False)
+self.wv = nn.Linear(args.n_embd, self.n_heads * self.head_dim, bias=False)
+self.wo = nn.Linear(self.n_heads * self.head_dim, args.dim, bias=False)
+```
+
+| 层 | 作用 | 输入 → 输出 |
+|----|------|-------------|
+| `wq` | 投影为 Query | `(n_embd)` → `(n_heads × head_dim)` |
+| `wk` | 投影为 Key | `(n_embd)` → `(n_heads × head_dim)` |
+| `wv` | 投影为 Value | `(n_embd)` → `(n_heads × head_dim)` |
+| `wo` | 融合多头输出 | `(n_heads × head_dim)` → `(dim)` |
+
+数值示例（`dim=8`, `n_heads=2`, `head_dim=4`）：
+
+```python
+x.shape = (1, 3, 8)    # 3 个 token，每个 8 维
+
+xq = wq(x)             # (1, 3, 8)
+# 最后一维 8 = 2 个头 × 每头 4 维，可拆为：
+#   头0: xq[..., 0:4]
+#   头1: xq[..., 4:8]
+```
+
+`wq/wk/wv` 用一个大矩阵 `(n_embd, n_heads × head_dim)` 等价于多个头的投影矩阵拼接，一次矩阵乘法即可算出所有头的 Q/K/V。`wo` 则在多头 attention 完成后，将拼接结果再线性变换回 `dim` 维。
+
+### 拆分为多头：`view` + `transpose`
+
+投影后的 `xq/xk/xv` 形状为 `(B, T, dim)`，需拆成 `(B, n_heads, T, head_dim)` 以便每个头独立计算 attention：
+
+```python
+xq = xq.view(bsz, seqlen, self.n_heads, self.head_dim).transpose(1, 2)
+xk = xk.view(bsz, seqlen_k, self.n_heads, self.head_dim).transpose(1, 2)
+xv = xv.view(bsz, seqlen_k, self.n_heads, self.head_dim).transpose(1, 2)
+```
+
+以 `B=1, T=3, n_heads=2, head_dim=2, dim=4` 为例：
+
+| 步骤 | 形状 | 含义 |
+|------|------|------|
+| `wq(x)` 后 | `(1, 3, 4)` | 3 个 token，每个 4 维（2 头拼在一起） |
+| `.view(1, 3, 2, 2)` | `(1, 3, 2, 2)` | 每个 token 拆成 2 个头，每头 2 维 |
+| `.transpose(1, 2)` | `(1, 2, 3, 2)` | 按头分组，每头含 3 个 token 向量 |
+
+`view` 把 `[a0, a1, b0, b1]` 拆成头0 `[a0, a1]` 与头1 `[b0, b1]`；`transpose(1, 2)` 从「先 token 后头」变为「先头后 token」，使每个头形成独立的 `(T, head_dim)` 矩阵，便于后续 `matmul`：
+
+```python
+raw_scores = torch.matmul(xq, xk.transpose(2, 3))
+# (1, 2, 3, 2) @ (1, 2, 2, 3) = (1, 2, 3, 3)
+#  每个头独立计算 3×3 的 attention 分数
+```
+
+可运行示例：
+
+```python
+import torch
+
+B, T, n_heads, head_dim = 1, 3, 2, 2
+xq = torch.arange(B * T * n_heads * head_dim, dtype=torch.float).view(B, T, -1)
+xq = xq.view(B, T, n_heads, head_dim).transpose(1, 2)
+
+print(xq.shape)       # torch.Size([1, 2, 3, 2])
+print("头0:\n", xq[0, 0])   # token0~2 在头0的向量
+print("头1:\n", xq[0, 1])   # token0~2 在头1的向量
+```
+
+### 因果 mask（Causal Mask）
+
+当 `is_causal=True` 时，在 `__init__` 中构造上三角 mask，防止 token  attend 到未来位置：
+
+```python
+mask = torch.full((1, 1, args.max_seq_len, args.max_seq_len), float("-inf"))
+mask = torch.triu(mask, diagonal=1)
+self.register_buffer("mask", mask)
+```
+
+`max_seq_len=4` 时，mask 矩阵（去掉前两维 broadcast 维）为：
+
+```
+        key: 0    1    2    3
+query 0    0  -inf -inf -inf
+      1    0    0  -inf -inf
+      2    0    0    0  -inf
+      3    0    0    0    0
+```
+
+- `mask[i, j] = 0`：query 位置 `i` 可以 attend 到 key 位置 `j`（`j ≤ i`）
+- `mask[i, j] = -inf`：禁止 attend 到未来 token（`j > i`）
+
+前向时将 mask 加到 scores 上，再 softmax；`-inf` 位置的权重变为 0：
+
+```python
+scores = scores + self.mask[:, :, :seqlen, :seqlen_k]
+```
+
+示例：softmax 前 `scores[0] = [2.0, 1.0, 0.5]`，加上 mask `[0, -inf, -inf]` 后，softmax 结果约为 `[1.0, 0, 0]`，即 token 0 只能看自己。
+
+`register_buffer` 将 mask 注册为模型缓冲区：不参与训练，但会随模型保存/加载并自动迁移到 GPU。
+
+### 拼接多头、输出投影与 resid_dropout
+
+每个头算完 `weights @ V` 后得到 `head_output`，形状为 `(B, n_heads, T, head_dim)`。随后三行代码完成输出收尾：
+
+```python
+output = head_output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)  # 拼接多头
+output = self.wo(output)                                                  # 输出投影
+output = self.resid_dropout(output)                                       # 残差 dropout
+```
+
+#### 拼接多头：`transpose` + `contiguous` + `view`
+
+以 `B=1, T=3, n_heads=2, head_dim=2, dim=4` 为例，`head_output.shape = (1, 2, 3, 2)`：
+
+```
+头0: token0 [1, 2]   token1 [3, 4]   token2 [5, 6]
+头1: token0 [7, 8]   token1 [9, 10]  token2 [11, 12]
+```
+
+| 步骤 | 形状 | 含义 |
+|------|------|------|
+| `head_output` | `(1, 2, 3, 2)` | 先按头、再按 token |
+| `.transpose(1, 2)` | `(1, 3, 2, 2)` | 先按 token、再按头，便于拼接 |
+| `.contiguous()` | `(1, 3, 2, 2)` | 保证内存连续（`transpose` 后 `view` 需要） |
+| `.view(1, 3, -1)` | `(1, 3, 4)` | 每个 token 的 4 维 = 2 头 × 每头 2 维 |
+
+拼接结果：
+
+```
+token0: [1, 2, 7, 8]
+token1: [3, 4, 9, 10]
+token2: [5, 6, 11, 12]
+```
+
+#### 输出投影 `Wo`
+
+`wo = Linear(n_heads × head_dim, dim)`，在上例中为 `Linear(4, 4)`。拼接只是把各头向量首尾相接，头与头之间尚未混合；`Wo` 对每个 token 的 `dim` 维向量做线性变换，学习如何融合各头信息：
+
+```
+拼接: [头0 的 2 维 | 头1 的 2 维]  →  Wo  →  融合后的 4 维输出
+```
+
+形状不变：`(B, T, dim) → (B, T, dim)`。与 attention 前的 `Wq/Wk/Wv`（输入 → 多头）对应，`Wo` 负责 attention 后的多头 → 模型维度。
+
+#### 残差 dropout
+
+`resid_dropout` 作用于模块最终输出。在 Transformer 中通常加在残差连接之前：
+
+```
+x → MultiHeadAttention → resid_dropout → + x → 下一层
+```
+
+| Dropout | 作用对象 | 目的 |
+|---------|----------|------|
+| `attn_dropout` | attention 权重 | 正则化「看哪里」 |
+| `resid_dropout` | 模块输出 | 正则化「传什么给下一层」 |
+
+训练模式（`model.train()`）下随机置零部分元素；推理模式（`model.eval()`）下 dropout 关闭，输出不变。
+
+#### 后半段流程小结
+
+```
+head_output          (B, n_heads, T, head_dim)   各头 attention 输出
+      ↓ transpose + contiguous + view
+output (concat)      (B, T, dim)                 按 token 拼接所有头
+      ↓ Wo
+output (after Wo)    (B, T, dim)                 线性融合多头
+      ↓ resid_dropout
+final output         (B, T, dim)                 训练时随机丢弃部分值
+```
+
 ## 环境准备
 
 ```bash
@@ -132,11 +361,17 @@ pytest -v
 # 只运行 attention 相关测试
 pytest test_attention.py -v
 
+# 只运行多头注意力相关测试
+pytest test_multihead_attention.py -v
+
 # 运行单个用例
 pytest test_attention.py::test_manual_computation -v
+pytest test_multihead_attention.py::test_causal_mask_blocks_future_tokens -v
 ```
 
 ## 测试用例说明
+
+### `test_attention.py`
 
 | 用例 | 说明 |
 |------|------|
@@ -146,9 +381,22 @@ pytest test_attention.py::test_manual_computation -v
 | `test_output_is_weighted_sum_of_values` | 验证 `output = weights @ value` |
 | `test_with_dropout` | 验证训练模式下 dropout 会改变注意力权重 |
 
+### `test_multihead_attention.py`
+
+| 用例 | 说明 |
+|------|------|
+| `test_output_shape` | 验证输出形状为 `(batch, seq, dim)` |
+| `test_invalid_head_count` | `dim` 不能被 `n_heads` 整除时抛出断言 |
+| `test_causal_mask_blocks_future_tokens` | 因果 mask 下，修改未来 token 不影响过去位置输出 |
+| `test_non_causal_uses_future_tokens` | 非因果模式下，未来 token 会影响输出 |
+| `test_cross_attention_accepts_different_qkv` | q/k/v 序列长度不同时仍可前向 |
+| `test_gradient_flow` | 反向传播梯度正常 |
+
 ## 调试日志
 
-`attention()` 使用 Python `logging` 输出 DEBUG 级别日志（形状、统计量、dropout 状态等）。查看日志示例：
+`attention()` 与 `MultiHeadAttention.forward()` 均使用 Python `logging` 输出 DEBUG 级别日志（张量形状、统计量、dropout / mask 状态等）。`MultiHeadAttention` 复用 `attention.py` 中的 `_tensor_summary` 格式化张量信息，日志风格与单头 attention 一致。
+
+### `attention()`
 
 ```python
 import logging
@@ -163,8 +411,132 @@ v = torch.randn(1, 4, 6)
 attention(q, k, v)
 ```
 
-运行测试时若需同时看到日志，可加上 pytest 的 log 参数：
+日志覆盖：`query` / `key` / `value` → `raw_scores` → `scaled_scores` → softmax 权重 → dropout（可选）→ 输出。
+
+### `MultiHeadAttention`
+
+```python
+import logging
+import torch
+from multihead_attention import ModelArgs, MultiHeadAttention
+
+logging.basicConfig(level=logging.DEBUG, format="%(name)s | %(levelname)s | %(message)s")
+
+args = ModelArgs(dim=64, n_heads=8, dropout=0.1, max_seq_len=512)
+mha = MultiHeadAttention(args, is_causal=True)
+
+x = torch.randn(2, 16, 64)
+mha(x, x, x)
+```
+
+日志覆盖各前向阶段：
+
+| 阶段 | 日志内容 |
+|------|----------|
+| 输入 | `q` / `k` / `v` 形状与统计量；`n_heads`、`head_dim`、`is_causal`、`training` |
+| 线性投影 | `xq` / `xk` / `xv`（Wq / Wk / Wv 之后） |
+| 拆头 | 多头张量 `(B, n_heads, T, head_dim)` |
+| Attention | `raw_scores` → `scaled_scores` → 因果 mask（若启用）→ softmax 权重 |
+| Dropout | `attn_dropout` 是否修改权重 |
+| 输出 | `weights @ V` → 拼接多头 → `Wo` → `resid_dropout` |
+
+### 运行测试时查看日志
 
 ```bash
+# 单头 attention
 pytest test_attention.py -v --log-cli-level=DEBUG
+
+# 多头 attention
+pytest test_multihead_attention.py -v --log-cli-level=DEBUG
+
+# 全部测试
+pytest -v --log-cli-level=DEBUG
 ```
+
+## 开源训练与强化学习框架推荐
+
+手写 Attention / MultiHeadAttention 之后，若要进入模型训练、微调与对齐阶段，可按下面分类选用开源框架。
+
+### 通用深度学习训练
+
+| 框架 | 特点 | 适合场景 |
+|------|------|----------|
+| [PyTorch](https://pytorch.org/) | 生态最大、论文复现多、调试直观 | 本仓库已使用，继续用它最自然 |
+| [Lightning](https://lightning.ai/) | 封装训练循环、分布式、日志 | 小模型实验，减少手写 train/eval 循环 |
+| [Accelerate](https://github.com/huggingface/accelerate) | Hugging Face 出品，几乎零侵入 | 单机多卡 / 多机，改动现有代码少 |
+| [DeepSpeed](https://github.com/microsoft/DeepSpeed) | ZeRO 显存优化 | 7B+ 全量或微调，显存紧张时 |
+| [FSDP](https://pytorch.org/tutorials/intermediate/FSDP_tutorial.html) | PyTorch 原生分片 | 不想引入 DeepSpeed 时的原生方案 |
+
+建议：基础阶段继续 PyTorch；需要多卡或更大模型时，叠加 **Accelerate** 或 **DeepSpeed**。
+
+### 大模型训练 / 微调（SFT、LoRA 等）
+
+| 框架 | 特点 | 适合场景 |
+|------|------|----------|
+| [Transformers](https://github.com/huggingface/transformers) | 模型、Tokenizer、Trainer 一体 | 加载预训练模型、做 SFT 的第一选择 |
+| [TRL](https://github.com/huggingface/trl) | HF 官方 RLHF 库，与 Transformers 无缝 | SFT → DPO / PPO / GRPO 一条龙 |
+| [LLaMA-Factory](https://github.com/hiyouga/LLaMA-Factory) | 配置化微调，中文文档友好 | 快速 LoRA / QLoRA 微调，少写代码 |
+| [Axolotl](https://github.com/OpenAccess-AI-Collective/axolotl) | YAML 配置驱动 | 社区常用微调方案，可复现性好 |
+| [Megatron-LM](https://github.com/NVIDIA/Megatron-LM) | NVIDIA 预训练栈 | 从零预训练 / 超大规模 |
+| [Colossal-AI](https://github.com/hpcaitech/ColossalAI) | 国产，易用的大模型训练 | 预训练 + 微调，对国内环境友好 |
+
+推荐学习路径：
+
+```
+手写 Attention（本仓库） → Transformers 加载模型 → LLaMA-Factory 做 LoRA → TRL 做 DPO / RLHF
+```
+
+### 强化学习框架
+
+#### 通用 RL（游戏、机器人、控制）
+
+| 框架 | 特点 | 适合场景 |
+|------|------|----------|
+| [Stable-Baselines3](https://github.com/DRL-RM/stable-baselines3) | API 简单、文档好 | PPO / A2C / DQN 等经典算法入门 |
+| [CleanRL](https://github.com/vwxyzjn/cleanrl) | 单文件实现，易读易改 | 理解 RL 算法原理（类似本仓库手写 attention） |
+| [RLlib](https://docs.ray.io/en/latest/rllib/index.html) | Ray 生态，分布式强 | 大规模并行 RL |
+| [Tianshou](https://github.com/thu-ml/tianshou) | 国产、PyTorch 原生 | 研究型实验，模块化好 |
+
+#### LLM 对齐 / RLHF
+
+| 框架 | 特点 | 适合场景 |
+|------|------|----------|
+| [TRL](https://github.com/huggingface/trl) | PPO、DPO、GRPO、KTO 等 | **LLM RLHF 首选**，与 HF 生态一致 |
+| [OpenRLHF](https://github.com/OpenRLHF/OpenRLHF) | 完整 RLHF 流水线（Reward Model + PPO） | 跑完整 RLHF，而非仅 DPO |
+| [verl](https://github.com/volcengine/verl) | 字节开源，HybridFlow 架构 | 大规模 RLHF / GRPO |
+| [NeMo-Aligner](https://github.com/NVIDIA/NeMo-Aligner) | NVIDIA 对齐工具 | 企业级，与 NeMo 预训练栈配合 |
+
+RLHF 常见流程：
+
+```
+SFT 监督微调
+      ↓
+Reward Model / 偏好数据
+      ↓
+PPO 或 DPO / GRPO
+      ↓
+对齐后的模型
+```
+
+- **DPO / GRPO**：实现简单、显存友好，目前主流（DeepSeek、Qwen 等用 GRPO 做推理增强）。
+- **PPO + Reward Model**：经典 RLHF，工程更重，适合 OpenRLHF / verl。
+
+### 按学习阶段选型
+
+| 阶段 | 推荐组合 |
+|------|----------|
+| 现在（手写 Attention / MHA） | PyTorch + pytest（本仓库） |
+| 加载并微调小 LLM | Transformers + PEFT + LLaMA-Factory |
+| 理解 RL 算法 | CleanRL 或 Stable-Baselines3 |
+| LLM 对齐（DPO / GRPO） | TRL |
+| 完整 RLHF / 大规模 GRPO | OpenRLHF 或 verl |
+| 从零预训练 | Megatron-LM / DeepSpeed + 自建数据管线 |
+
+### 推荐学习仓库
+
+| 仓库 | 说明 |
+|------|------|
+| [nanoGPT](https://github.com/karpathy/nanoGPT) | 最小 GPT 训练，理念与本仓库接近 |
+| [minGPT](https://github.com/karpathy/minGPT) | 更精简的 GPT 实现 |
+| [LLaMA-Factory](https://github.com/hiyouga/LLaMA-Factory) | 微调上手最快 |
+| [TRL examples](https://github.com/huggingface/trl/tree/main/examples) | DPO / PPO 官方示例 |
