@@ -8,8 +8,12 @@
 |------|------|
 | `attention.py` | 单头 scaled dot-product attention 函数 |
 | `multihead_attention.py` | `MultiHeadAttention` 模块与 `ModelArgs` 配置 |
+| `encoder.py` | `LayerNorm`、`MLP`、`EncoderLayer` 与 `Encoder` 模块 |
+| `decoder.py` | `DecoderLayer` 与 `Decoder` 模块 |
 | `test_attention.py` | `attention()` 单元测试 |
 | `test_multihead_attention.py` | `MultiHeadAttention` 单元测试 |
+| `test_encoder.py` | `EncoderLayer`、`Encoder` 及相关模块单元测试 |
+| `test_decoder.py` | `DecoderLayer`、`Decoder` 单元测试 |
 
 ## 核心运算：Q @ K^T
 
@@ -136,6 +140,7 @@ out = mha(x, x, x)          # 自注意力，输出形状 (2, 16, 64)
 | `dim` | 模型隐藏维度，必须能被 `n_heads` 整除 |
 | `n_heads` | 注意力头数 |
 | `n_embd` | 输入嵌入维度，默认等于 `dim` |
+| `n_layer` | Encoder / Decoder 堆叠层数，默认 `1` |
 | `dropout` | attention 与残差 dropout 概率 |
 | `max_seq_len` | 因果 mask 的最大序列长度 |
 
@@ -334,6 +339,235 @@ output (after Wo)    (B, T, dim)                 线性融合多头
 final output         (B, T, dim)                 训练时随机丢弃部分值
 ```
 
+## Encoder 层：EncoderLayer
+
+`encoder.py` 在 `MultiHeadAttention` 之上，组合 **LayerNorm**、**双向自注意力** 与 **前馈网络（MLP）**，构成 Transformer Encoder 的一个子层。采用 Pre-LayerNorm 结构：先归一化，再进入子模块，最后与输入做残差相加。
+
+### 基本用法
+
+```python
+import torch
+from encoder import EncoderLayer
+from multihead_attention import ModelArgs
+
+args = ModelArgs(dim=64, n_heads=8, dropout=0.1, max_seq_len=512)
+layer = EncoderLayer(args)
+
+x = torch.randn(2, 16, 64)  # (batch, seq_len, dim)
+out = layer(x)                # 输出形状 (2, 16, 64)
+```
+
+### 模块组成
+
+| 模块 | 说明 |
+|------|------|
+| `LayerNorm` | 对最后一维做均值/方差归一化，带可学习仿射参数 `a_2`、`b_2` |
+| `MLP` | 两层线性变换 + ReLU + Dropout：`Linear → ReLU → Linear → Dropout` |
+| `EncoderLayer` | 两个 LayerNorm + 一个 `MultiHeadAttention(is_causal=False)` + 一个 MLP |
+| `Encoder` | N 个 `EncoderLayer` 堆叠 + 栈顶 LayerNorm |
+
+### 前向流程
+
+```
+输入 x  (B, T, dim)
+      ↓
+LayerNorm  →  MultiHeadAttention（双向，is_causal=False）  →  + x  →  h
+      ↓
+LayerNorm  →  MLP  →  + h  →  输出
+```
+
+对应代码：
+
+```python
+norm_x = self.attention_norm(x)
+h = x + self.attention.forward(norm_x, norm_x, norm_x)
+out = h + self.feed_forward.forward(self.fnn_norm(h))
+```
+
+与 Decoder 的区别：Encoder 使用 `is_causal=False`，每个 token 可以 attend 到序列中所有位置（包括「未来」token），适合理解整句上下文。
+
+### LayerNorm
+
+对每个 token 在特征维度上独立归一化：
+
+```python
+mean = x.mean(-1, keepdim=True)
+std = x.std(-1, keepdim=True)
+return self.a_2 * (x - mean) / (std + self.eps) + self.b_2
+```
+
+输入 `(B, T, dim)` 时，`mean` / `std` 形状为 `(B, T, 1)`，沿最后一维广播。
+
+### MLP
+
+```python
+return self.dropout(self.w2(F.relu(self.w1(x))))
+```
+
+| 层 | 作用 |
+|----|------|
+| `w1` | `dim → hidden_dim` |
+| ReLU | 非线性激活 |
+| `w2` | `hidden_dim → dim` |
+| `dropout` | 训练时正则化，推理时关闭 |
+
+`EncoderLayer` 中 `hidden_dim` 与 `dim` 相同（`MLP(args.dim, args.dim, args.dropout)`）。
+
+### 残差连接
+
+Encoder 子层有两处残差：
+
+```
+x ─────────────────────────────┐
+│                              ↓ (+)
+└→ LayerNorm → Attention ──────┘ → h
+h ─────────────────────────────┐
+│                              ↓ (+)
+└→ LayerNorm → MLP ────────────┘ → out
+```
+
+残差让底层信息直接传到高层，缓解深层网络训练困难。
+
+## Encoder 块：Encoder
+
+`Encoder` 由 **N 个 `EncoderLayer`** 堆叠而成，最后经一层 **LayerNorm** 输出，对应 Transformer 原文中的 Encoder 栈。
+
+### 基本用法
+
+```python
+import torch
+from encoder import Encoder
+from multihead_attention import ModelArgs
+
+args = ModelArgs(dim=64, n_heads=8, n_layer=6, dropout=0.1, max_seq_len=512)
+encoder = Encoder(args)
+
+x = torch.randn(2, 16, 64)  # (batch, seq_len, dim)
+out = encoder(x)              # 输出形状 (2, 16, 64)
+```
+
+### 前向流程
+
+```
+输入 x  (B, T, dim)
+      ↓
+EncoderLayer × N（每层含 Attention + MLP + 残差）
+      ↓
+LayerNorm
+      ↓
+输出  (B, T, dim)
+```
+
+对应代码：
+
+```python
+for layer in self.layers:
+    x = layer(x)
+return self.norm(x)
+```
+
+| 子模块 | 说明 |
+|--------|------|
+| `layers` | `ModuleList`，长度为 `args.n_layer` |
+| `norm` | 栈顶 LayerNorm，对最终 hidden states 规范化 |
+
+## Decoder 层：DecoderLayer
+
+`decoder.py` 实现 Transformer Decoder 子层，在 Encoder 输出的基础上，对目标序列做 **掩码自注意力**、**交叉注意力** 与 **前馈网络**，同样采用 Pre-LayerNorm + 残差结构。
+
+### 基本用法
+
+```python
+import torch
+from decoder import DecoderLayer
+from multihead_attention import ModelArgs
+
+args = ModelArgs(dim=64, n_heads=8, dropout=0.1, max_seq_len=512)
+layer = DecoderLayer(args)
+
+x = torch.randn(2, 16, 64)       # decoder 输入 (batch, dec_seq, dim)
+enc_out = torch.randn(2, 20, 64) # encoder 输出 (batch, enc_seq, dim)
+out = layer(x, enc_out)          # 输出形状 (2, 16, 64)
+```
+
+### 模块组成
+
+| 子模块 | 说明 |
+|--------|------|
+| `mask_attention` | 掩码自注意力，`is_causal=True`，禁止 attend 未来 token |
+| `attention` | 交叉注意力，`is_causal=False`；q 来自 decoder，k/v 来自 `enc_out` |
+| `feed_forward` | 与 Encoder 相同的两层 MLP |
+| `attention_norm_1/2`、`ffn_norm` | 三个 Pre-LayerNorm |
+
+### 前向流程
+
+```
+decoder 输入 x  (B, T_dec, dim)          encoder 输出 enc_out  (B, T_enc, dim)
+      ↓                                              ↓
+LayerNorm → Masked Self-Attention → + x
+      ↓
+LayerNorm → Cross-Attention(q=x, k=v=enc_out) → + x  →  h
+      ↓
+LayerNorm → MLP → + h  →  输出
+```
+
+对应代码：
+
+```python
+norm_x = self.attention_norm_1(x)
+x = x + self.mask_attention.forward(norm_x, norm_x, norm_x)
+norm_x = self.attention_norm_2(x)
+h = x + self.attention.forward(norm_x, enc_out, enc_out)
+out = h + self.feed_forward.forward(self.ffn_norm(h))
+```
+
+与 Encoder 的区别：
+
+| 对比项 | Encoder | Decoder |
+|--------|---------|---------|
+| 自注意力 | 双向（`is_causal=False`） | 因果掩码（`is_causal=True`） |
+| 交叉注意力 | 无 | q 来自 decoder，k/v 来自 encoder |
+| LayerNorm 数量 | 2 | 3 |
+
+## Decoder 块：Decoder
+
+`Decoder` 由 **N 个 `DecoderLayer`** 堆叠而成，最后经一层 **LayerNorm** 输出。
+
+### 基本用法
+
+```python
+import torch
+from decoder import Decoder
+from multihead_attention import ModelArgs
+
+args = ModelArgs(dim=64, n_heads=8, n_layer=6, dropout=0.1, max_seq_len=512)
+decoder = Decoder(args)
+
+x = torch.randn(2, 16, 64)
+enc_out = torch.randn(2, 20, 64)
+out = decoder(x, enc_out)  # 输出形状 (2, 16, 64)
+```
+
+### 前向流程
+
+```
+输入 x, enc_out
+      ↓
+DecoderLayer × N（每层接收相同的 enc_out）
+      ↓
+LayerNorm
+      ↓
+输出  (B, T_dec, dim)
+```
+
+对应代码：
+
+```python
+for layer in self.layers:
+    x = layer(x, enc_out)
+return self.norm(x)
+```
+
 ## 环境准备
 
 ```bash
@@ -364,9 +598,19 @@ pytest test_attention.py -v
 # 只运行多头注意力相关测试
 pytest test_multihead_attention.py -v
 
+# 只运行 Encoder 相关测试
+pytest test_encoder.py -v
+
+# 只运行 Decoder 相关测试
+pytest test_decoder.py -v
+
 # 运行单个用例
 pytest test_attention.py::test_manual_computation -v
 pytest test_multihead_attention.py::test_causal_mask_blocks_future_tokens -v
+pytest test_encoder.py::test_attention_is_non_causal -v
+pytest test_encoder.py::test_encoder_output_shape -v
+pytest test_decoder.py::test_mask_attention_blocks_future_tokens -v
+pytest test_decoder.py::test_cross_attention_uses_encoder_output -v
 ```
 
 ## 测试用例说明
@@ -391,6 +635,43 @@ pytest test_multihead_attention.py::test_causal_mask_blocks_future_tokens -v
 | `test_non_causal_uses_future_tokens` | 非因果模式下，未来 token 会影响输出 |
 | `test_cross_attention_accepts_different_qkv` | q/k/v 序列长度不同时仍可前向 |
 | `test_gradient_flow` | 反向传播梯度正常 |
+
+### `test_encoder.py`
+
+| 用例 | 说明 |
+|------|------|
+| `test_output_shape` | 验证输出形状为 `(batch, seq, dim)` |
+| `test_attention_is_non_causal` | Encoder 使用双向注意力，修改未来 token 会影响过去位置 |
+| `test_has_pre_layer_norm_submodules` | 验证 Pre-LayerNorm 子模块与 `is_causal=False` |
+| `test_residual_connection_changes_output` | 残差连接使输出不同于输入 |
+| `test_gradient_flow` | 梯度能流到 attention、MLP 与 LayerNorm |
+| `test_layer_norm_normalizes_last_dimension` | `LayerNorm` 在最后一维做归一化 |
+| `test_mlp_output_shape` | `MLP` 输出形状与输入一致 |
+| `test_mlp_dropout_changes_output_in_train_mode` | 训练模式下 MLP dropout 生效 |
+| `test_invalid_head_count` | `dim` 不能被 `n_heads` 整除时抛出断言 |
+| `test_encoder_output_shape` | `Encoder` 输出形状为 `(batch, seq, dim)` |
+| `test_encoder_has_n_layers` | `Encoder` 包含 `n_layer` 个 `EncoderLayer` 与最终 `norm` |
+| `test_encoder_applies_final_layer_norm` | 栈顶 LayerNorm 对最后一维做归一化 |
+| `test_encoder_stacked_layers_differ_from_single_layer` | 多层堆叠与单层输出不同 |
+| `test_encoder_gradient_flow` | 梯度能流到各层与栈顶 LayerNorm |
+
+### `test_decoder.py`
+
+| 用例 | 说明 |
+|------|------|
+| `test_decoder_layer_output_shape` | 输出形状为 `(batch, dec_seq, dim)` |
+| `test_decoder_layer_has_expected_submodules` | 三个 LayerNorm、因果/非因果注意力子模块 |
+| `test_mask_attention_blocks_future_tokens` | 掩码自注意力下，修改未来 token 不影响过去位置 |
+| `test_cross_attention_uses_encoder_output` | 修改 `enc_out` 会改变 decoder 输出 |
+| `test_cross_attention_accepts_different_seq_lengths` | decoder 与 encoder 序列长度可不同 |
+| `test_decoder_layer_residual_changes_output` | 残差连接使输出不同于输入 |
+| `test_decoder_layer_gradient_flow` | 梯度能流到 x、`enc_out` 与各子模块 |
+| `test_invalid_head_count` | `dim` 不能被 `n_heads` 整除时抛出断言 |
+| `test_decoder_output_shape` | `Decoder` 输出形状为 `(batch, dec_seq, dim)` |
+| `test_decoder_has_n_layers` | `Decoder` 包含 `n_layer` 个 `DecoderLayer` 与最终 `norm` |
+| `test_decoder_applies_final_layer_norm` | 栈顶 LayerNorm 对最后一维做归一化 |
+| `test_decoder_stacked_layers_differ_from_single_layer` | 多层堆叠与单层输出不同 |
+| `test_decoder_gradient_flow` | 梯度能流到各层与栈顶 LayerNorm |
 
 ## 调试日志
 
@@ -455,7 +736,7 @@ pytest -v --log-cli-level=DEBUG
 
 ## 开源训练与强化学习框架推荐
 
-手写 Attention / MultiHeadAttention 之后，若要进入模型训练、微调与对齐阶段，可按下面分类选用开源框架。
+手写 Attention / MultiHeadAttention / Encoder / Decoder 之后，若要进入模型训练、微调与对齐阶段，可按下面分类选用开源框架。
 
 ### 通用深度学习训练
 
@@ -525,7 +806,7 @@ PPO 或 DPO / GRPO
 
 | 阶段 | 推荐组合 |
 |------|----------|
-| 现在（手写 Attention / MHA） | PyTorch + pytest（本仓库） |
+| 现在（手写 Attention / MHA / Encoder / Decoder） | PyTorch + pytest（本仓库） |
 | 加载并微调小 LLM | Transformers + PEFT + LLaMA-Factory |
 | 理解 RL 算法 | CleanRL 或 Stable-Baselines3 |
 | LLM 对齐（DPO / GRPO） | TRL |

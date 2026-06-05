@@ -20,6 +20,7 @@ class ModelArgs:
     dim: int
     n_heads: int
     n_embd: int | None = None
+    n_layer: int = 1
     dropout: float = 0.0
     max_seq_len: int = 512
 
