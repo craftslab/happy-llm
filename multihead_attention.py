@@ -21,6 +21,8 @@ class ModelArgs:
     n_heads: int
     n_embd: int | None = None
     n_layer: int = 1
+    vocab_size: int | None = None
+    block_size: int | None = None
     dropout: float = 0.0
     max_seq_len: int = 512
 

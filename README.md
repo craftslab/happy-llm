@@ -10,10 +10,12 @@
 | `multihead_attention.py` | `MultiHeadAttention` 模块与 `ModelArgs` 配置 |
 | `encoder.py` | `LayerNorm`、`MLP`、`EncoderLayer` 与 `Encoder` 模块 |
 | `decoder.py` | `DecoderLayer` 与 `Decoder` 模块 |
+| `transformer.py` | `PositionalEncoding` 与完整 `Transformer` 模型 |
 | `test_attention.py` | `attention()` 单元测试 |
 | `test_multihead_attention.py` | `MultiHeadAttention` 单元测试 |
 | `test_encoder.py` | `EncoderLayer`、`Encoder` 及相关模块单元测试 |
 | `test_decoder.py` | `DecoderLayer`、`Decoder` 单元测试 |
+| `test_transformer.py` | `Transformer` 与 `PositionalEncoding` 单元测试 |
 
 ## 核心运算：Q @ K^T
 
@@ -141,6 +143,8 @@ out = mha(x, x, x)          # 自注意力，输出形状 (2, 16, 64)
 | `n_heads` | 注意力头数 |
 | `n_embd` | 输入嵌入维度，默认等于 `dim` |
 | `n_layer` | Encoder / Decoder 堆叠层数，默认 `1` |
+| `vocab_size` | 词表大小，构建 `Transformer` 时必填 |
+| `block_size` | 最大序列长度，用于位置编码与输入校验 |
 | `dropout` | attention 与残差 dropout 概率 |
 | `max_seq_len` | 因果 mask 的最大序列长度 |
 
@@ -568,6 +572,74 @@ for layer in self.layers:
 return self.norm(x)
 ```
 
+## Transformer 模型
+
+`transformer.py` 将词嵌入、位置编码、Encoder、Decoder 与语言模型头组装为完整的 Transformer，对应 Happy-LLM 教程中的端到端结构。
+
+### 基本用法
+
+```python
+import torch
+from multihead_attention import ModelArgs
+from transformer import Transformer
+
+args = ModelArgs(
+    dim=64,
+    n_heads=8,
+    n_layer=2,
+    vocab_size=5000,
+    block_size=128,
+    dropout=0.1,
+    max_seq_len=128,
+)
+model = Transformer(args)
+
+idx = torch.randint(0, args.vocab_size, (2, 16))  # token ids (batch, seq)
+logits, loss = model(idx)                           # 推理：logits (2, 1, vocab_size)
+
+targets = torch.randint(0, args.vocab_size, (2, 16))
+logits, loss = model(idx, targets)                  # 训练：logits (2, 16, vocab_size)，loss 标量
+```
+
+### 模块组成
+
+| 子模块 | 说明 |
+|--------|------|
+| `wte` | 词嵌入 `Embedding(vocab_size, n_embd)` |
+| `wpe` | 正弦/余弦位置编码，加到 token embedding 上 |
+| `drop` | Embedding 后的 Dropout |
+| `encoder` | N 层 Encoder 栈 |
+| `decoder` | N 层 Decoder 栈，cross-attend 到 encoder 输出 |
+| `lm_head` | 线性投影到词表维度 |
+
+### 前向流程
+
+```
+idx (B, T)
+      ↓
+Token Embedding + Positional Encoding + Dropout
+      ↓
+Encoder → enc_out
+      ↓
+Decoder(x, enc_out)
+      ↓
+lm_head → logits
+      ↓
+（若提供 targets）cross_entropy → loss
+```
+
+推理时只取序列最后一个位置的 hidden state 计算 logits，形状为 `(B, 1, vocab_size)`；训练时对每个位置计算 logits，形状为 `(B, T, vocab_size)`。
+
+### PositionalEncoding
+
+对序列每个位置生成固定的 sin/cos 编码，与 token embedding 相加：
+
+```python
+x = x + self.pe[:, : x.size(1)]
+```
+
+`block_size` 决定预计算位置编码的最大长度；输入序列长度 `T` 必须满足 `T <= block_size`。
+
 ## 环境准备
 
 ```bash
@@ -604,6 +676,9 @@ pytest test_encoder.py -v
 # 只运行 Decoder 相关测试
 pytest test_decoder.py -v
 
+# 只运行 Transformer 相关测试
+pytest test_transformer.py -v
+
 # 运行单个用例
 pytest test_attention.py::test_manual_computation -v
 pytest test_multihead_attention.py::test_causal_mask_blocks_future_tokens -v
@@ -611,6 +686,7 @@ pytest test_encoder.py::test_attention_is_non_causal -v
 pytest test_encoder.py::test_encoder_output_shape -v
 pytest test_decoder.py::test_mask_attention_blocks_future_tokens -v
 pytest test_decoder.py::test_cross_attention_uses_encoder_output -v
+pytest test_transformer.py::test_transformer_inference_logits_shape -v
 ```
 
 ## 测试用例说明
@@ -672,6 +748,21 @@ pytest test_decoder.py::test_cross_attention_uses_encoder_output -v
 | `test_decoder_applies_final_layer_norm` | 栈顶 LayerNorm 对最后一维做归一化 |
 | `test_decoder_stacked_layers_differ_from_single_layer` | 多层堆叠与单层输出不同 |
 | `test_decoder_gradient_flow` | 梯度能流到各层与栈顶 LayerNorm |
+
+### `test_transformer.py`
+
+| 用例 | 说明 |
+|------|------|
+| `test_transformer_inference_logits_shape` | 推理时 logits 形状为 `(batch, 1, vocab_size)` |
+| `test_transformer_training_logits_and_loss` | 训练时 logits 为 `(batch, seq, vocab_size)`，loss 为标量 |
+| `test_transformer_exceeds_block_size_raises` | 序列长度超过 `block_size` 时抛出断言 |
+| `test_transformer_requires_vocab_size` | 缺少 `vocab_size` 时无法构建模型 |
+| `test_transformer_requires_block_size` | 缺少 `block_size` 时无法构建模型 |
+| `test_get_num_params` | 统计参数量，支持排除 embedding |
+| `test_positional_encoding_preserves_shape` | 位置编码不改变张量形状 |
+| `test_positional_encoding_changes_values` | 位置编码会改变 embedding 数值 |
+| `test_loss_ignores_masked_targets` | 部分 `targets=-1` 时仍能得到有限 loss，且与全量 targets 不同 |
+| `test_transformer_gradient_flow` | 训练模式下反向传播梯度正常 |
 
 ## 调试日志
 
@@ -736,7 +827,7 @@ pytest -v --log-cli-level=DEBUG
 
 ## 开源训练与强化学习框架推荐
 
-手写 Attention / MultiHeadAttention / Encoder / Decoder 之后，若要进入模型训练、微调与对齐阶段，可按下面分类选用开源框架。
+手写 Attention / MultiHeadAttention / Encoder / Decoder / Transformer 之后，若要进入模型训练、微调与对齐阶段，可按下面分类选用开源框架。
 
 ### 通用深度学习训练
 
@@ -806,7 +897,7 @@ PPO 或 DPO / GRPO
 
 | 阶段 | 推荐组合 |
 |------|----------|
-| 现在（手写 Attention / MHA / Encoder / Decoder） | PyTorch + pytest（本仓库） |
+| 现在（手写 Attention / MHA / Encoder / Decoder / Transformer） | PyTorch + pytest（本仓库） |
 | 加载并微调小 LLM | Transformers + PEFT + LLaMA-Factory |
 | 理解 RL 算法 | CleanRL 或 Stable-Baselines3 |
 | LLM 对齐（DPO / GRPO） | TRL |
